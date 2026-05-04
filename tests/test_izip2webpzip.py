@@ -3,7 +3,7 @@ import io
 import zipfile
 
 import pytest
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 import izip2webpzip
 
@@ -21,6 +21,30 @@ def _make_zip(images: dict[str, Image.Image], format: str = "PNG") -> bytes:
 def _entries(zip_bytes: bytes) -> dict[str, bytes]:
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         return {name: zf.read(name) for name in zf.namelist()}
+
+
+@pytest.fixture
+def mixed_zip() -> bytes:
+    """ZIP with one PNG image and one non-image (text) entry."""
+    buf = io.BytesIO()
+    img_buf = io.BytesIO()
+    Image.new("RGB", (50, 50), "red").save(img_buf, format="PNG")
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("01.png", img_buf.getvalue())
+        zf.writestr("ComicInfo.xml", b"<?xml version='1.0'?><ComicInfo />")
+    return buf.getvalue()
+
+
+@pytest.fixture
+def corrupted_image_zip() -> bytes:
+    """ZIP with one valid PNG and one corrupted entry that has an image extension."""
+    buf = io.BytesIO()
+    img_buf = io.BytesIO()
+    Image.new("RGB", (50, 50), "red").save(img_buf, format="PNG")
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("01.png", img_buf.getvalue())
+        zf.writestr("broken.png", b"this is not a real PNG")
+    return buf.getvalue()
 
 
 def test_basic_conversion() -> None:
@@ -42,6 +66,15 @@ def test_path_input(tmp_path) -> None:  # type: ignore[no-untyped-def]
 
     assert out_path.exists()
     assert out == out_path.read_bytes()
+    assert "a.webp" in _entries(out)
+
+
+def test_pathlib_path_accepted(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    src_path = tmp_path / "in.zip"
+    src_path.write_bytes(_make_zip({"a.png": Image.new("RGB", (50, 50), "blue")}))
+    out_path = tmp_path / "out.zip"
+
+    out = izip2webpzip.convert(src_path, out_path)
     assert "a.webp" in _entries(out)
 
 
@@ -89,58 +122,60 @@ def test_directory_entries_skipped() -> None:
     out = izip2webpzip.convert(src)
     entries = _entries(out)
     assert "subdir/01.webp" in entries
-    assert "subdir/" not in entries  # directory entry skipped
+    assert "subdir/" not in entries
 
 
-def test_on_error_keep_preserves_original() -> None:
-    buf = io.BytesIO()
-    img_buf = io.BytesIO()
-    Image.new("RGB", (50, 50), "red").save(img_buf, format="PNG")
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("01.png", img_buf.getvalue())
-        zf.writestr("readme.txt", b"not an image")
-    src = buf.getvalue()
-
-    out = izip2webpzip.convert(src, on_error="keep")
+def test_non_image_passes_through(mixed_zip: bytes) -> None:
+    """Non-image extensions (e.g. xml) should be copied as-is regardless of on_error."""
+    out = izip2webpzip.convert(mixed_zip, on_error="skip")  # even with skip
     entries = _entries(out)
 
     assert "01.webp" in entries
-    assert "readme.txt" in entries
-    assert entries["readme.txt"] == b"not an image"
+    assert "ComicInfo.xml" in entries
+    assert entries["ComicInfo.xml"] == b"<?xml version='1.0'?><ComicInfo />"
 
 
-def test_on_error_skip_drops_failing() -> None:
-    buf = io.BytesIO()
-    img_buf = io.BytesIO()
-    Image.new("RGB", (50, 50), "red").save(img_buf, format="PNG")
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("01.png", img_buf.getvalue())
-        zf.writestr("readme.txt", b"not an image")
-    src = buf.getvalue()
+def test_on_error_warn_keeps_original_with_warning(corrupted_image_zip: bytes) -> None:
+    """warn: corrupted image entry kept as-is + warnings.warn emitted."""
+    with pytest.warns(UserWarning, match="Failed to convert broken.png"):
+        out = izip2webpzip.convert(corrupted_image_zip, on_error="warn")
 
-    out = izip2webpzip.convert(src, on_error="skip")
     entries = _entries(out)
-
     assert "01.webp" in entries
-    assert "readme.txt" not in entries
+    assert "broken.png" in entries  # kept as original
 
 
-def test_on_error_raise_propagates() -> None:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("readme.txt", b"not an image")
-    src = buf.getvalue()
-
-    with pytest.raises(Exception):
-        izip2webpzip.convert(src, on_error="raise")
+def test_on_error_skip_drops_failing(corrupted_image_zip: bytes) -> None:
+    """skip: corrupted image entry dropped from output."""
+    out = izip2webpzip.convert(corrupted_image_zip, on_error="skip", log_func=lambda _: None)
+    entries = _entries(out)
+    assert "01.webp" in entries
+    assert "broken.png" not in entries
 
 
-def test_log_func_called() -> None:
+def test_on_error_raise_propagates(corrupted_image_zip: bytes) -> None:
+    """raise: corrupted image triggers UnidentifiedImageError or OSError."""
+    with pytest.raises((UnidentifiedImageError, OSError)):
+        izip2webpzip.convert(corrupted_image_zip, on_error="raise")
+
+
+def test_transform_exception_propagates() -> None:
+    """transform-side bugs are NOT swallowed by on_error."""
     src = _make_zip({"01.png": Image.new("RGB", (50, 50), "red")})
-    seen: list[str] = []
 
-    izip2webpzip.convert(src, log_func=seen.append)
+    def buggy_transform(img):  # type: ignore[no-untyped-def]
+        raise AttributeError("simulated transform bug")
+
+    with pytest.raises(AttributeError, match="simulated transform bug"):
+        izip2webpzip.convert(src, transform=buggy_transform, on_error="warn")
+
+
+def test_log_func_called(mixed_zip: bytes) -> None:
+    """log_func receives every entry name."""
+    seen: list[str] = []
+    izip2webpzip.convert(mixed_zip, log_func=seen.append)
     assert "01.png" in seen
+    assert "ComicInfo.xml" in seen
 
 
 def test_transform_applied() -> None:
@@ -163,9 +198,16 @@ def test_to_webp_bytes_pure_function() -> None:
     assert b"WEBP" in out[:12]
 
 
+def test_max_image_pixels_zero_warns() -> None:
+    """max_image_pixels=0 disables decompression-bomb guard; must warn."""
+    src = _make_zip({"01.png": Image.new("RGB", (50, 50), "red")})
+
+    with pytest.warns(UserWarning, match="decompression bomb guard"):
+        izip2webpzip.convert(src, max_image_pixels=0)
+
+
 def test_la_mode_image_via_transform() -> None:
-    """LA mode (grayscale + alpha) is not directly WebP-savable in some Pillow
-    versions, so users handle it via transform."""
+    """LA mode (grayscale + alpha) is handled by user via transform."""
     src = _make_zip({"01.png": Image.new("LA", (50, 50), (128, 200))})
 
     def flatten(img: Image.Image) -> Image.Image:
@@ -175,3 +217,8 @@ def test_la_mode_image_via_transform() -> None:
 
     out = izip2webpzip.convert(src, transform=flatten)
     assert _entries(out)["01.webp"][:4] == b"RIFF"
+
+
+def test_version_exposed() -> None:
+    assert hasattr(izip2webpzip, "__version__")
+    assert isinstance(izip2webpzip.__version__, str)
