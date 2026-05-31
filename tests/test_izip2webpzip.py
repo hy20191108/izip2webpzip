@@ -222,3 +222,98 @@ def test_la_mode_image_via_transform() -> None:
 def test_version_exposed() -> None:
     assert hasattr(izip2webpzip, "__version__")
     assert isinstance(izip2webpzip.__version__, str)
+
+
+def test_verify_zip_images_passes_for_valid_output() -> None:
+    src = _make_zip({
+        "01.png": Image.new("RGB", (50, 50), "red"),
+        "02.png": Image.new("RGB", (60, 60), "green"),
+    })
+    out = izip2webpzip.convert(src)
+
+    ok, failures = izip2webpzip.verify_zip_images(out)
+    assert ok
+    assert failures == []
+
+
+def test_verify_zip_images_detects_corruption() -> None:
+    # A ZIP whose .png entry is just garbage bytes.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("broken.png", b"this is definitely not PNG data")
+    corrupted = buf.getvalue()
+
+    ok, failures = izip2webpzip.verify_zip_images(corrupted)
+    assert not ok
+    assert any("broken.png" in f for f in failures)
+
+
+def test_verify_zip_images_skips_non_image_entries(mixed_zip: bytes) -> None:
+    """ComicInfo.xml etc. are not verified (since they're not images)."""
+    # mixed_zip contains "01.png" + "ComicInfo.xml". Verify still passes since
+    # only the image is checked and it's valid.
+    ok, failures = izip2webpzip.verify_zip_images(mixed_zip)
+    assert ok, failures
+
+
+def test_verify_zip_images_sample_size_subset() -> None:
+    images = {f"{i:02d}.png": Image.new("RGB", (10, 10), "red") for i in range(20)}
+    src = _make_zip(images)
+
+    ok, failures = izip2webpzip.verify_zip_images(src, sample_size=5)
+    assert ok
+    assert failures == []
+
+
+def test_convert_replace_overwrites_source(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    src = tmp_path / "manga.cbz"
+    src.write_bytes(_make_zip({"01.png": Image.new("RGB", (50, 50), "red")}))
+    original_size = src.stat().st_size
+
+    izip2webpzip.convert_replace(src)
+
+    assert src.exists()
+    # File replaced; size differs from original (WebP is smaller for this content).
+    assert src.stat().st_size != original_size
+    assert "01.webp" in _entries(src.read_bytes())
+    # Temp file cleaned up.
+    assert not (tmp_path / "manga.cbz.izip2webpzip.tmp").exists()
+
+
+def test_convert_replace_keeps_source_on_verify_failure(  # type: ignore[no-untyped-def]
+    tmp_path, monkeypatch,
+) -> None:
+    src = tmp_path / "manga.cbz"
+    original_bytes = _make_zip({"01.png": Image.new("RGB", (50, 50), "red")})
+    src.write_bytes(original_bytes)
+
+    # Force verification to report failure (patch the actual module, not
+    # the re-export in __init__, so convert_replace's local reference picks
+    # up the patched function).
+    from izip2webpzip import izip2webpzip as core
+    monkeypatch.setattr(
+        core, "verify_zip_images",
+        lambda *a, **kw: (False, ["fake_failure: simulated"]),
+    )
+
+    with pytest.raises(ValueError, match="Verification failed"):
+        izip2webpzip.convert_replace(src)
+
+    # Source unchanged, temp removed.
+    assert src.read_bytes() == original_bytes
+    assert not (tmp_path / "manga.cbz.izip2webpzip.tmp").exists()
+
+
+def test_convert_replace_cleans_temp_on_convert_error(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    src = tmp_path / "manga.cbz"
+    original_bytes = _make_zip({"01.png": Image.new("RGB", (50, 50), "red")})
+    src.write_bytes(original_bytes)
+
+    def boom(_img):  # type: ignore[no-untyped-def]
+        raise RuntimeError("transform exploded")
+
+    with pytest.raises(RuntimeError, match="transform exploded"):
+        izip2webpzip.convert_replace(src, transform=boom)
+
+    assert src.read_bytes() == original_bytes
+    assert not (tmp_path / "manga.cbz.izip2webpzip.tmp").exists()

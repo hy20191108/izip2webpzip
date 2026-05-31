@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import os
 import sys
 import warnings
 import zipfile
@@ -84,6 +85,48 @@ def configure_pillow_safety(
     finally:
         Image.MAX_IMAGE_PIXELS = saved_pixels
         ImageFile.LOAD_TRUNCATED_IMAGES = saved_truncated
+
+
+def verify_zip_images(
+    zip_input: Union[str, bytes, Path],
+    *,
+    sample_size: Optional[int] = None,
+) -> tuple[bool, list[str]]:
+    """Verify that image entries in the ZIP can be fully decoded by Pillow.
+
+    Useful for confirming a converted ZIP is intact before deleting the
+    source. Non-image entries (per IMAGE_EXTENSIONS) are skipped.
+
+    Args:
+        zip_input: Path to a ZIP file, or its bytes.
+        sample_size: If given, randomly sample at most this many image
+                     entries. None means verify every image entry.
+
+    Returns:
+        (all_ok, failures). `failures` is a list of "entry_name: reason"
+        strings; empty when all_ok is True.
+    """
+    _ensure_format_support()
+    src_bytes = _load_zip_bytes(zip_input)
+    failures: list[str] = []
+
+    with zipfile.ZipFile(io.BytesIO(src_bytes)) as src:
+        names = [
+            n for n in src.namelist()
+            if not zipfile.Path(src, n).is_dir() and _is_image_entry(n)
+        ]
+        if sample_size is not None and sample_size < len(names):
+            import random
+            names = random.sample(names, sample_size)
+
+        for name in names:
+            try:
+                with Image.open(io.BytesIO(src.read(name))) as img:
+                    img.load()  # force full decode
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"{name}: {type(e).__name__}: {e}")
+
+    return (not failures, failures)
 
 
 def to_webp_bytes(
@@ -234,14 +277,76 @@ def convert(
     return result
 
 
+def convert_replace(
+    zip_path: Union[str, Path],
+    *,
+    quality: int = 85,
+    lossless: bool = False,
+    transform: Optional[Transform] = None,
+    on_error: ErrorMode = "warn",
+    progress: ProgressMode = False,
+    log_func: Optional[Callable[[str], None]] = None,
+    max_image_pixels: Optional[int] = None,
+    load_truncated_images: bool = False,
+    verify: bool = True,
+) -> None:
+    """Convert a ZIP in place, atomically (komono make_webpzip-style).
+
+    Writes the converted ZIP to a temp file in the same directory, optionally
+    verifies that every image entry decodes, then atomically `os.replace()`s
+    the source. On verification failure the temp file is removed and the
+    source is left intact.
+
+    Args:
+        zip_path: Path to the source ZIP/CBZ. The same path will be overwritten
+                  with the converted result.
+        verify: If True (default), call `verify_zip_images()` on the temp file
+                before replacing the source. Verification failure raises
+                ValueError without touching the source.
+        Other args: see convert().
+    """
+    src = Path(zip_path)
+    tmp = src.with_name(src.name + ".izip2webpzip.tmp")
+
+    try:
+        convert(
+            src, tmp,
+            progress=progress, log_func=log_func,
+            quality=quality, lossless=lossless, transform=transform,
+            on_error=on_error,
+            max_image_pixels=max_image_pixels,
+            load_truncated_images=load_truncated_images,
+        )
+
+        if verify:
+            ok, failures = verify_zip_images(tmp)
+            if not ok:
+                tmp.unlink()
+                raise ValueError(
+                    f"Verification failed for {len(failures)} image(s) in "
+                    f"converted output of {src.name!r}; source kept intact. "
+                    f"First failures: {failures[:3]}"
+                )
+
+        os.replace(tmp, src)
+    except BaseException:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
 def main() -> None:
     """CLI: izip2webpzip [--quality N] [--lossless] [--no-progress] <zip>...
 
-    Each input <name>.zip is converted to <name>.webp.zip, skipped if that
-    output already exists. Returns the count of failed inputs as exit code.
+    Each input ZIP is converted in-place: the source file is atomically
+    replaced with its WebP-recompressed version after verification. Returns
+    the count of failed inputs as exit code.
     """
     parser = argparse.ArgumentParser(
-        description="Convert ZIP of images to ZIP of WebP images, in-memory.",
+        description="Convert ZIP of images to ZIP of WebP images, in-place.",
     )
     parser.add_argument("zip_files", nargs="+", help="Input ZIP/CBZ files")
     parser.add_argument(
@@ -256,20 +361,22 @@ def main() -> None:
         "--no-progress", action="store_true",
         help="Disable per-file progress bar",
     )
+    parser.add_argument(
+        "--no-verify", action="store_true",
+        help="Skip post-conversion verification before replacing source (faster, less safe)",
+    )
     args = parser.parse_args()
 
     show_progress: ProgressMode = False if args.no_progress else True
     error_count = 0
     for zippath in tqdm.tqdm(args.zip_files, desc="process"):
         tqdm.tqdm.write(zippath)
-        out_path = Path(zippath).with_suffix(".webp.zip")
-        if out_path.is_file():
-            continue  # idempotent: skip already-converted files
         try:
-            convert(
-                zippath, out_path, progress=show_progress,
+            convert_replace(
+                zippath, progress=show_progress,
                 quality=args.quality, lossless=args.lossless,
                 on_error="warn", log_func=tqdm.tqdm.write,
+                verify=not args.no_verify,
             )
         except Exception as e:
             tqdm.tqdm.write(f"ERROR: {zippath}: {e}", file=sys.stderr)
